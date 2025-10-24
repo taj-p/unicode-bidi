@@ -704,25 +704,51 @@ impl crate::BidiContext {
         line: core::ops::Range<usize>,
         out_text: &mut Vec<u16>,
     ) {
-        if !level::has_rtl(&info.levels[line.clone()]) {
-            out_text.clear();
-            out_text.extend_from_slice(&info.text[line]);
-            return;
-        }
-        let mut levels_buf = Vec::new();
-        let mut runs_buf = Vec::new();
-        self.visual_runs_into_utf16(info, para, line.clone(), &mut levels_buf, &mut runs_buf);
+        reorder_line_into_utf16_impl(
+            self,
+            info.text,
+            &info.levels,
+            &info.original_classes,
+            para,
+            line,
+            out_text,
+        );
+    }
+}
+
+fn reorder_line_into_utf16_impl(
+    _ctx: &mut crate::BidiContext,
+    text: &[u16],
+    full_levels: &[Level],
+    full_classes: &[BidiClass],
+    para: &ParagraphInfo,
+    line: core::ops::Range<usize>,
+    out_text: &mut Vec<u16>,
+) {
+    if !level::has_rtl(&full_levels[line.clone()]) {
         out_text.clear();
-        out_text.reserve(line.len());
-        for run in runs_buf {
-            if levels_buf[run.start].is_rtl() {
-                let mut buf = [0; 2];
-                for c in info.text[run].chars().rev() {
-                    out_text.extend(c.encode_utf16(&mut buf).iter());
-                }
-            } else {
-                out_text.extend(&info.text[run]);
+        out_text.extend_from_slice(&text[line]);
+        return;
+    }
+    let mut levels_buf = Vec::new();
+    let mut runs_buf = Vec::new();
+    levels_buf.clear();
+    levels_buf.extend_from_slice(full_levels);
+    let line_classes = &full_classes[line.clone()];
+    let line_levels = &mut levels_buf[line.clone()];
+    let line_str: &[u16] = &text[line.clone()];
+    reorder_levels(line_classes, line_levels, line_str, para.level);
+    super::visual_runs_for_line_into(&levels_buf, &line, &mut runs_buf);
+    out_text.clear();
+    out_text.reserve(line.len());
+    for run in runs_buf {
+        if levels_buf[run.start].is_rtl() {
+            let mut buf = [0; 2];
+            for c in text[run].chars().rev() {
+                out_text.extend(c.encode_utf16(&mut buf).iter());
             }
+        } else {
+            out_text.extend(&text[run]);
         }
     }
 }
