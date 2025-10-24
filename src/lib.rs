@@ -107,6 +107,313 @@ use smallvec::SmallVec;
 use crate::format_chars as chars;
 use crate::BidiClass::*;
 
+/// Output buffers that can be reused across calls when constructing a BidiInfo (UTF-8).
+///
+/// These allow callers to provide their own allocations for results to reduce allocation churn.
+#[derive(Default)]
+pub struct BidiInfoBuffers {
+    pub original_classes: Vec<BidiClass>,
+    pub levels: Vec<Level>,
+    pub paragraphs: Vec<ParagraphInfo>,
+}
+
+/// Output buffers that can be reused across calls when constructing a ParagraphBidiInfo (UTF-8).
+#[derive(Default)]
+pub struct ParagraphBidiInfoBuffers {
+    pub original_classes: Vec<BidiClass>,
+    pub levels: Vec<Level>,
+}
+
+/// A reusable context holding scratch buffers to avoid intermediate allocations.
+///
+/// Use this with the "_into" constructors to reuse both scratch and result buffers.
+pub struct BidiContext {
+    #[cfg(feature = "smallvec")]
+    pub(crate) isolate_stack: SmallVec<[usize; 8]>,
+    #[cfg(not(feature = "smallvec"))]
+    pub(crate) isolate_stack: Vec<usize>,
+
+    // Scratch used during explicit/prepare phases
+    pub(crate) level_runs: LevelRunVec,
+    pub(crate) sequences: crate::prepare::IsolatingRunSequenceVec,
+
+    // Per-paragraph flags scratch parallel to `ParagraphInfo`
+    pub(crate) paragraph_flags: Vec<ParagraphInfoFlags>,
+
+    // Scratch copy of processing classes (mutable working copy)
+    pub(crate) processing_classes: Vec<BidiClass>,
+}
+
+impl BidiContext {
+    /// Create a new empty context.
+    pub fn new() -> Self {
+        BidiContext {
+            #[cfg(feature = "smallvec")]
+            isolate_stack: SmallVec::new(),
+            #[cfg(not(feature = "smallvec"))]
+            isolate_stack: Vec::new(),
+            level_runs: LevelRunVec::new(),
+            sequences: crate::prepare::IsolatingRunSequenceVec::new(),
+            paragraph_flags: Vec::new(),
+            processing_classes: Vec::new(),
+        }
+    }
+
+    /// Clear scratch state, preserving capacities.
+    pub fn clear(&mut self) {
+        self.isolate_stack.clear();
+        self.level_runs.clear();
+        self.sequences.clear();
+        self.paragraph_flags.clear();
+        self.processing_classes.clear();
+    }
+
+    /// UTF-8: Construct BidiInfo into caller-provided buffers, reusing this context's scratch.
+    pub fn new_with_data_source_into<'a, D: BidiDataSource>(
+        &mut self,
+        data_source: &D,
+        text: &'a str,
+        default_para_level: Option<Level>,
+        mut out: BidiInfoBuffers,
+    ) -> BidiInfo<'a> {
+        out.original_classes.clear();
+        out.paragraphs.clear();
+        self.paragraph_flags.clear();
+
+        // Avoid borrowing `self` mutably for both method receiver and field at once.
+        let mut tmp_flags = core::mem::take(&mut self.paragraph_flags);
+        let (_para_level_last, _is_pure_ltr_last, _has_isolate_controls_last) = self
+            .compute_initial_info_into(
+                data_source,
+                text,
+                default_para_level,
+                Some((&mut out.paragraphs, &mut tmp_flags)),
+                &mut out.original_classes,
+            );
+        self.paragraph_flags = tmp_flags;
+
+        // Prepare processing classes scratch as a copy (no new allocation if capacity is enough)
+        self.processing_classes.clear();
+        self.processing_classes
+            .extend_from_slice(&out.original_classes);
+
+        // Prepare levels sized to text with paragraph base level per paragraph
+        out.levels.clear();
+        out.levels.resize(text.len(), LTR_LEVEL);
+
+        for (para, flags) in out.paragraphs.iter().zip(self.paragraph_flags.iter()) {
+            // Initialize paragraph slice of levels to paragraph level
+            for lvl in &mut out.levels[para.range.clone()] {
+                *lvl = para.level;
+            }
+            if para.level == LTR_LEVEL && flags.is_pure_ltr {
+                continue;
+            }
+            let text_slice = &text[para.range.clone()];
+            let original_classes_slice = &out.original_classes[para.range.clone()];
+            let processing_slice = &mut self.processing_classes[para.range.clone()];
+            let levels_slice = &mut out.levels[para.range.clone()];
+
+            compute_bidi_info_for_para_with_scratch_into(
+                data_source,
+                para,
+                flags.is_pure_ltr,
+                flags.has_isolate_controls,
+                text_slice,
+                original_classes_slice,
+                processing_slice,
+                levels_slice,
+                &mut self.level_runs,
+                &mut self.sequences,
+            );
+        }
+
+        BidiInfo {
+            text,
+            original_classes: out.original_classes,
+            paragraphs: out.paragraphs,
+            levels: out.levels,
+        }
+    }
+
+    /// Compute initial information writing into provided buffers (generic over text source).
+    pub(crate) fn compute_initial_info_into<'a, D: BidiDataSource, T: TextSource<'a> + ?Sized>(
+        &mut self,
+        data_source: &D,
+        text: &'a T,
+        default_para_level: Option<Level>,
+        mut split_paragraphs: Option<(&mut Vec<ParagraphInfo>, &mut Vec<ParagraphInfoFlags>)>,
+        out_original_classes: &mut Vec<BidiClass>,
+    ) -> (Level, bool, bool) {
+        out_original_classes.clear();
+        out_original_classes.reserve(text.len());
+
+        self.isolate_stack.clear();
+
+        debug_assert!(
+            if let Some((ref paragraphs, ref flags)) = split_paragraphs {
+                paragraphs.is_empty() && flags.is_empty()
+            } else {
+                true
+            }
+        );
+
+        let mut para_start = 0;
+        let mut para_level = default_para_level;
+        let mut is_pure_ltr = true;
+        let mut has_isolate_controls = false;
+
+        #[cfg(feature = "flame_it")]
+        flame::start("compute_initial_info_into(): iter text.char_indices()");
+
+        for (i, c) in text.char_indices() {
+            let class = data_source.bidi_class(c);
+
+            #[cfg(feature = "flame_it")]
+            flame::start("original_classes.extend()");
+
+            let len = T::char_len(c);
+            out_original_classes.extend(repeat(class).take(len));
+
+            #[cfg(feature = "flame_it")]
+            flame::end("original_classes.extend()");
+
+            match class {
+                B => {
+                    if let Some((ref mut paragraphs, ref mut flags)) = split_paragraphs {
+                        let para_end = i + len;
+                        paragraphs.push(ParagraphInfo {
+                            range: para_start..para_end,
+                            level: para_level.unwrap_or(LTR_LEVEL),
+                        });
+                        flags.push(ParagraphInfoFlags {
+                            is_pure_ltr,
+                            has_isolate_controls,
+                        });
+                        para_start = para_end;
+                        para_level = default_para_level;
+                        is_pure_ltr = true;
+                        has_isolate_controls = false;
+                        self.isolate_stack.clear();
+                    }
+                }
+                L | R | AL => {
+                    if class != L {
+                        is_pure_ltr = false;
+                    }
+                    match self.isolate_stack.last() {
+                        Some(&start) => {
+                            if out_original_classes[start] == FSI {
+                                for j in 0..T::char_len(chars::FSI) {
+                                    out_original_classes[start + j] = if class == L { LRI } else { RLI };
+                                }
+                            }
+                        }
+                        None => {
+                            if para_level.is_none() {
+                                para_level = Some(if class != L { RTL_LEVEL } else { LTR_LEVEL });
+                            }
+                        }
+                    }
+                }
+                AN | LRE | RLE | LRO | RLO => {
+                    is_pure_ltr = false;
+                }
+                RLI | LRI | FSI => {
+                    is_pure_ltr = false;
+                    has_isolate_controls = true;
+                    self.isolate_stack.push(i);
+                }
+                PDI => {
+                    self.isolate_stack.pop();
+                }
+                _ => {}
+            }
+        }
+
+        if let Some((paragraphs, flags)) = split_paragraphs {
+            if para_start < text.len() {
+                paragraphs.push(ParagraphInfo {
+                    range: para_start..text.len(),
+                    level: para_level.unwrap_or(LTR_LEVEL),
+                });
+                flags.push(ParagraphInfoFlags {
+                    is_pure_ltr,
+                    has_isolate_controls,
+                });
+            }
+            debug_assert_eq!(paragraphs.len(), flags.len());
+        }
+        debug_assert_eq!(out_original_classes.len(), text.len());
+
+        #[cfg(feature = "flame_it")]
+        flame::end("compute_initial_info_into(): iter text.char_indices()");
+
+        (
+            para_level.unwrap_or(LTR_LEVEL),
+            is_pure_ltr,
+            has_isolate_controls,
+        )
+    }
+
+    /// UTF-8: Produce reordered levels for an entire paragraph into `out_levels`.
+    pub fn reordered_levels_into(
+        &mut self,
+        info: &BidiInfo<'_>,
+        para: &ParagraphInfo,
+        line: Range<usize>,
+        out_levels: &mut Vec<Level>,
+    ) {
+        assert!(line.start <= info.levels.len());
+        assert!(line.end <= info.levels.len());
+        out_levels.clear();
+        out_levels.extend_from_slice(&info.levels);
+        let line_classes = &info.original_classes[line.clone()];
+        let line_levels = &mut out_levels[line.clone()];
+        reorder_levels(line_classes, line_levels, info.text.subrange(line), para.level);
+    }
+
+    /// UTF-8: Compute visual runs and levels into provided buffers.
+    pub fn visual_runs_into(
+        &mut self,
+        info: &BidiInfo<'_>,
+        para: &ParagraphInfo,
+        line: Range<usize>,
+        out_levels: &mut Vec<Level>,
+        out_runs: &mut Vec<LevelRun>,
+    ) {
+        self.reordered_levels_into(info, para, line.clone(), out_levels);
+        visual_runs_for_line_into(out_levels, &line, out_runs);
+    }
+
+    /// UTF-8: Reorder a line writing the result into `out_text`.
+    pub fn reorder_line_into(
+        &mut self,
+        info: &BidiInfo<'_>,
+        para: &ParagraphInfo,
+        line: Range<usize>,
+        out_text: &mut String,
+    ) {
+        if !level::has_rtl(&info.levels[line.clone()]) {
+            out_text.clear();
+            out_text.push_str(&info.text[line]);
+            return;
+        }
+        let mut levels_buf = Vec::new();
+        let mut runs_buf = Vec::new();
+        self.visual_runs_into(info, para, line.clone(), &mut levels_buf, &mut runs_buf);
+        out_text.clear();
+        out_text.reserve(line.len());
+        for run in runs_buf {
+            if levels_buf[run.start].is_rtl() {
+                out_text.extend(info.text[run].chars().rev());
+            } else {
+                out_text.push_str(&info.text[run]);
+            }
+        }
+    }
+}
+
 /// Trait that abstracts over a text source for use by the bidi algorithms.
 /// We implement this for str (UTF-8) and for [u16] (UTF-16, native-endian).
 /// (For internal unicode-bidi use; API may be unstable.)
@@ -274,8 +581,8 @@ impl<'text> InitialInfoExt<'text> {
         text: &'a str,
         default_para_level: Option<Level>,
     ) -> InitialInfoExt<'a> {
-        let mut paragraphs = Vec::<ParagraphInfo>::new();
-        let mut flags = Vec::<ParagraphInfoFlags>::new();
+        let mut paragraphs = Vec::<ParagraphInfo>::new(); // TODO: Can be passed in.
+        let mut flags = Vec::<ParagraphInfoFlags>::new(); // TODO: Can be passed in.
         let (original_classes, _, _, _) = compute_initial_info(
             data_source,
             text,
@@ -307,141 +614,17 @@ fn compute_initial_info<'a, D: BidiDataSource, T: TextSource<'a> + ?Sized>(
     default_para_level: Option<Level>,
     mut split_paragraphs: Option<(&mut Vec<ParagraphInfo>, &mut Vec<ParagraphInfoFlags>)>,
 ) -> (Vec<BidiClass>, Level, bool, bool) {
-    let mut original_classes = Vec::with_capacity(text.len());
-
-    // The stack contains the starting code unit index for each nested isolate we're inside.
-    #[cfg(feature = "smallvec")]
-    let mut isolate_stack = SmallVec::<[usize; 8]>::new();
-    #[cfg(not(feature = "smallvec"))]
-    let mut isolate_stack = Vec::new();
-
-    debug_assert!(
-        if let Some((ref paragraphs, ref flags)) = split_paragraphs {
-            paragraphs.is_empty() && flags.is_empty()
-        } else {
-            true
-        }
+    let mut original_classes = Vec::new();
+    let mut ctx = BidiContext::new();
+    let (para_level, is_pure_ltr, has_isolate_controls) = ctx.compute_initial_info_into(
+        data_source,
+        text,
+        default_para_level,
+        split_paragraphs,
+        &mut original_classes,
     );
 
-    let mut para_start = 0;
-    let mut para_level = default_para_level;
-
-    // Per-paragraph flag: can subsequent processing be skipped? Set to false if any
-    // RTL characters or bidi control characters are encountered in the paragraph.
-    let mut is_pure_ltr = true;
-    // Set to true if any bidi isolation controls are present in the paragraph.
-    let mut has_isolate_controls = false;
-
-    #[cfg(feature = "flame_it")]
-    flame::start("compute_initial_info(): iter text.char_indices()");
-
-    for (i, c) in text.char_indices() {
-        let class = data_source.bidi_class(c);
-
-        #[cfg(feature = "flame_it")]
-        flame::start("original_classes.extend()");
-
-        let len = T::char_len(c);
-        original_classes.extend(repeat(class).take(len));
-
-        #[cfg(feature = "flame_it")]
-        flame::end("original_classes.extend()");
-
-        match class {
-            B => {
-                if let Some((ref mut paragraphs, ref mut flags)) = split_paragraphs {
-                    // P1. Split the text into separate paragraphs. The paragraph separator is kept
-                    // with the previous paragraph.
-                    let para_end = i + len;
-                    paragraphs.push(ParagraphInfo {
-                        range: para_start..para_end,
-                        // P3. If no character is found in p2, set the paragraph level to zero.
-                        level: para_level.unwrap_or(LTR_LEVEL),
-                    });
-                    flags.push(ParagraphInfoFlags {
-                        is_pure_ltr,
-                        has_isolate_controls,
-                    });
-                    // Reset state for the start of the next paragraph.
-                    para_start = para_end;
-                    // TODO: Support defaulting to direction of previous paragraph
-                    //
-                    // <http://www.unicode.org/reports/tr9/#HL1>
-                    para_level = default_para_level;
-                    is_pure_ltr = true;
-                    has_isolate_controls = false;
-                    isolate_stack.clear();
-                }
-            }
-
-            L | R | AL => {
-                if class != L {
-                    is_pure_ltr = false;
-                }
-                match isolate_stack.last() {
-                    Some(&start) => {
-                        if original_classes[start] == FSI {
-                            // X5c. If the first strong character between FSI and its matching
-                            // PDI is R or AL, treat it as RLI. Otherwise, treat it as LRI.
-                            for j in 0..T::char_len(chars::FSI) {
-                                original_classes[start + j] = if class == L { LRI } else { RLI };
-                            }
-                        }
-                    }
-
-                    None => {
-                        if para_level.is_none() {
-                            // P2. Find the first character of type L, AL, or R, while skipping
-                            // any characters between an isolate initiator and its matching
-                            // PDI.
-                            para_level = Some(if class != L { RTL_LEVEL } else { LTR_LEVEL });
-                        }
-                    }
-                }
-            }
-
-            AN | LRE | RLE | LRO | RLO => {
-                is_pure_ltr = false;
-            }
-
-            RLI | LRI | FSI => {
-                is_pure_ltr = false;
-                has_isolate_controls = true;
-                isolate_stack.push(i);
-            }
-
-            PDI => {
-                isolate_stack.pop();
-            }
-
-            _ => {}
-        }
-    }
-
-    if let Some((paragraphs, flags)) = split_paragraphs {
-        if para_start < text.len() {
-            paragraphs.push(ParagraphInfo {
-                range: para_start..text.len(),
-                level: para_level.unwrap_or(LTR_LEVEL),
-            });
-            flags.push(ParagraphInfoFlags {
-                is_pure_ltr,
-                has_isolate_controls,
-            });
-        }
-        debug_assert_eq!(paragraphs.len(), flags.len());
-    }
-    debug_assert_eq!(original_classes.len(), text.len());
-
-    #[cfg(feature = "flame_it")]
-    flame::end("compute_initial_info(): iter text.char_indices()");
-
-    (
-        original_classes,
-        para_level.unwrap_or(LTR_LEVEL),
-        is_pure_ltr,
-        has_isolate_controls,
-    )
+    (original_classes, para_level, is_pure_ltr, has_isolate_controls)
 }
 
 /// Bidi information of the text.
@@ -502,8 +685,8 @@ impl<'text> BidiInfo<'text> {
         let InitialInfoExt { base, flags, .. } =
             InitialInfoExt::new_with_data_source(data_source, text, default_para_level);
 
-        let mut levels = Vec::<Level>::with_capacity(text.len());
-        let mut processing_classes = base.original_classes.clone();
+        let mut levels = Vec::<Level>::with_capacity(text.len()); // TODO: Can be passed in.
+        let mut processing_classes = base.original_classes.clone(); // TODO: Can be passed in.
 
         for (para, flags) in base.paragraphs.iter().zip(flags.iter()) {
             let text = &text[para.range.clone()];
@@ -682,6 +865,16 @@ impl<'text> BidiInfo<'text> {
     pub fn has_rtl(&self) -> bool {
         level::has_rtl(&self.levels)
     }
+
+    /// Consume this BidiInfo and return its buffers for reuse.
+    #[inline]
+    pub fn into_buffers(self) -> BidiInfoBuffers {
+        BidiInfoBuffers {
+            original_classes: self.original_classes,
+            levels: self.levels,
+            paragraphs: self.paragraphs,
+        }
+    }
 }
 
 /// Bidi information of text treated as a single paragraph.
@@ -741,8 +934,8 @@ impl<'text> ParagraphBidiInfo<'text> {
         let (original_classes, paragraph_level, is_pure_ltr, has_isolate_controls) =
             compute_initial_info(data_source, text, default_para_level, None);
 
-        let mut levels = Vec::<Level>::with_capacity(text.len());
-        let mut processing_classes = original_classes.clone();
+        let mut levels = Vec::<Level>::with_capacity(text.len()); // TODO: Can be passed in.
+        let mut processing_classes = original_classes.clone(); // TODO: Can be passed in.
 
         let para_info = ParagraphInfo {
             range: Range {
@@ -863,6 +1056,15 @@ impl<'text> ParagraphBidiInfo<'text> {
     pub fn direction(&self) -> Direction {
         para_direction(&self.levels)
     }
+
+    /// Consume this ParagraphBidiInfo and return its buffers for reuse.
+    #[inline]
+    pub fn into_buffers(self) -> ParagraphBidiInfoBuffers {
+        ParagraphBidiInfoBuffers {
+            original_classes: self.original_classes,
+            levels: self.levels,
+        }
+    }
 }
 
 /// Return a line of the text in display order based on resolved levels.
@@ -928,8 +1130,21 @@ fn reorder_line(
 /// [Rule L3]: https://www.unicode.org/reports/tr9/#L3
 /// [Rule L4]: https://www.unicode.org/reports/tr9/#L4
 fn visual_runs_for_line(levels: Vec<Level>, line: &Range<usize>) -> (Vec<Level>, Vec<LevelRun>) {
-    // Find consecutive level runs.
     let mut runs = Vec::new();
+    visual_runs_for_line_into(&levels, line, &mut runs);
+    (levels, runs)
+}
+
+/// Compute visual runs for a line, writing into provided out_runs and reusing `levels`.
+///
+/// `levels` should already have L1 applied; this applies L2 to determine run order.
+pub(crate) fn visual_runs_for_line_into(
+    levels: &Vec<Level>,
+    line: &Range<usize>,
+    out_runs: &mut Vec<LevelRun>,
+) {
+    // Find consecutive level runs.
+    out_runs.clear();
     let mut start = line.start;
     let mut run_level = levels[start];
     let mut min_level = run_level;
@@ -937,52 +1152,40 @@ fn visual_runs_for_line(levels: Vec<Level>, line: &Range<usize>) -> (Vec<Level>,
 
     for (i, &new_level) in levels.iter().enumerate().take(line.end).skip(start + 1) {
         if new_level != run_level {
-            // End of the previous run, start of a new one.
-            runs.push(start..i);
+            out_runs.push(start..i);
             start = i;
             run_level = new_level;
             min_level = cmp::min(run_level, min_level);
             max_level = cmp::max(run_level, max_level);
         }
     }
-    runs.push(start..line.end);
+    out_runs.push(start..line.end);
 
-    let run_count = runs.len();
+    let run_count = out_runs.len();
 
-    // Re-order the odd runs.
-    // <http://www.unicode.org/reports/tr9/#L2>
-
-    // Stop at the lowest *odd* level.
+    // Stop at the lowest odd level.
     min_level = min_level.new_lowest_ge_rtl().expect("Level error");
-    // This loop goes through contiguous chunks of level runs that have a level
-    // ≥ max_level and reverses their contents, reducing max_level by 1 each time.
     while max_level >= min_level {
-        // Look for the start of a sequence of consecutive runs of max_level or higher.
         let mut seq_start = 0;
         while seq_start < run_count {
-            if levels[runs[seq_start].start] < max_level {
+            if levels[out_runs[seq_start].start] < max_level {
                 seq_start += 1;
                 continue;
             }
-
-            // Found the start of a sequence. Now find the end.
             let mut seq_end = seq_start + 1;
             while seq_end < run_count {
-                if levels[runs[seq_end].start] < max_level {
+                if levels[out_runs[seq_end].start] < max_level {
                     break;
                 }
                 seq_end += 1;
             }
-            // Reverse the runs within this sequence.
-            runs[seq_start..seq_end].reverse();
-
+            out_runs[seq_start..seq_end].reverse();
             seq_start = seq_end;
         }
         max_level
             .lower(1)
             .expect("Lowering embedding level below zero");
     }
-    (levels, runs)
 }
 
 /// Reorders pre-calculated levels of a sequence of characters.
@@ -1133,6 +1336,61 @@ fn compute_bidi_info_for_para<'a, D: BidiDataSource, T: TextSource<'a> + ?Sized>
 
     implicit::resolve_levels(processing_classes, levels);
 
+    assign_levels_to_removed_chars(para.level, original_classes, levels);
+}
+
+/// Compute bidi info for a paragraph using provided scratch buffers, avoiding internal allocations.
+pub(crate) fn compute_bidi_info_for_para_with_scratch_into<'a, D: BidiDataSource, T: TextSource<'a> + ?Sized>(
+    data_source: &D,
+    para: &ParagraphInfo,
+    is_pure_ltr: bool,
+    has_isolate_controls: bool,
+    text: &'a T,
+    original_classes: &[BidiClass],
+    processing_classes: &mut [BidiClass],
+    levels: &mut [Level],
+    level_runs: &mut LevelRunVec,
+    sequences: &mut prepare::IsolatingRunSequenceVec,
+) {
+    if para.level == LTR_LEVEL && is_pure_ltr {
+        return;
+    }
+
+    level_runs.clear();
+    explicit::compute(
+        text,
+        para.level,
+        original_classes,
+        levels,
+        processing_classes,
+        level_runs,
+    );
+
+    sequences.clear();
+    prepare::isolating_run_sequences(
+        para.level,
+        original_classes,
+        levels,
+        core::mem::take(level_runs),
+        has_isolate_controls,
+        sequences,
+    );
+    // level_runs was moved; recreate empty scratch for next use
+    *level_runs = LevelRunVec::new();
+
+    for sequence in sequences.iter() {
+        implicit::resolve_weak(text, sequence, processing_classes);
+        implicit::resolve_neutral(
+            text,
+            data_source,
+            sequence,
+            levels,
+            original_classes,
+            processing_classes,
+        );
+    }
+
+    implicit::resolve_levels(processing_classes, levels);
     assign_levels_to_removed_chars(para.level, original_classes, levels);
 }
 

@@ -194,6 +194,7 @@ impl Level {
         }
     }
 
+    #[cfg(test)]
     pub fn vec(v: &[u8]) -> Vec<Level> {
         v.iter().map(|&x| x.into()).collect()
     }
