@@ -159,15 +159,6 @@ impl BidiContext {
         }
     }
 
-    /// Clear scratch state, preserving capacities.
-    pub fn clear(&mut self) {
-        self.isolate_stack.clear();
-        self.level_runs.clear();
-        self.sequences.clear();
-        self.paragraph_flags.clear();
-        self.processing_classes.clear();
-    }
-
     /// UTF-8: Construct BidiInfo into caller-provided buffers, reusing this context's scratch.
     pub fn new_with_data_source_into<'a, D: BidiDataSource>(
         &mut self,
