@@ -358,6 +358,16 @@ impl<'text> BidiInfo<'text> {
     pub fn has_rtl(&self) -> bool {
         level::has_rtl(&self.levels)
     }
+
+    /// Consume this BidiInfo and return its buffers for reuse.
+    #[inline]
+    pub fn into_buffers(self) -> crate::BidiInfoBuffers {
+        crate::BidiInfoBuffers {
+            original_classes: self.original_classes,
+            levels: self.levels,
+            paragraphs: self.paragraphs,
+        }
+    }
 }
 
 /// Bidi information of text treated as a single paragraph.
@@ -537,6 +547,15 @@ impl<'text> ParagraphBidiInfo<'text> {
     pub fn direction(&self) -> Direction {
         para_direction(&self.levels)
     }
+
+    /// Consume this ParagraphBidiInfo and return its buffers for reuse.
+    #[inline]
+    pub fn into_buffers(self) -> crate::ParagraphBidiInfoBuffers {
+        crate::ParagraphBidiInfoBuffers {
+            original_classes: self.original_classes,
+            levels: self.levels,
+        }
+    }
 }
 
 /// Return a line of the text in display order based on resolved levels.
@@ -578,6 +597,160 @@ fn reorder_line(
         }
     }
     result.into()
+}
+
+impl crate::BidiContext {
+    /// UTF-16: Construct BidiInfo into caller-provided buffers, reusing this context's scratch.
+    pub fn new_with_data_source_into_utf16<'a, D: BidiDataSource>(
+        &mut self,
+        data_source: &D,
+        text: &'a [u16],
+        default_para_level: Option<Level>,
+        mut out: crate::BidiInfoBuffers,
+    ) -> BidiInfo<'a> {
+        out.original_classes.clear();
+        out.paragraphs.clear();
+        self.paragraph_flags.clear();
+
+        // Avoid overlapping mutable borrows of `self` by temporarily taking flags.
+        let mut tmp_flags = core::mem::take(&mut self.paragraph_flags);
+        let (_para_level_last, _is_pure_ltr_last, _has_isolate_controls_last) = self
+            .compute_initial_info_into(
+                data_source,
+                text,
+                default_para_level,
+                Some((&mut out.paragraphs, &mut tmp_flags)),
+                &mut out.original_classes,
+            );
+        self.paragraph_flags = tmp_flags;
+
+        self.processing_classes.clear();
+        self.processing_classes
+            .extend_from_slice(&out.original_classes);
+
+        out.levels.clear();
+        out.levels.resize(text.len(), super::LTR_LEVEL);
+
+        for (para, flags) in out.paragraphs.iter().zip(self.paragraph_flags.iter()) {
+            for lvl in &mut out.levels[para.range.clone()] {
+                *lvl = para.level;
+            }
+            if para.level == super::LTR_LEVEL && flags.is_pure_ltr {
+                continue;
+            }
+            let text_slice = &text[para.range.clone()];
+            let original_classes_slice = &out.original_classes[para.range.clone()];
+            let processing_slice = &mut self.processing_classes[para.range.clone()];
+            let levels_slice = &mut out.levels[para.range.clone()];
+
+            crate::compute_bidi_info_for_para_with_scratch_into(
+                data_source,
+                para,
+                flags.is_pure_ltr,
+                flags.has_isolate_controls,
+                text_slice,
+                original_classes_slice,
+                processing_slice,
+                levels_slice,
+                &mut self.level_runs,
+                &mut self.sequences,
+            );
+        }
+
+        BidiInfo {
+            text,
+            original_classes: out.original_classes,
+            paragraphs: out.paragraphs,
+            levels: out.levels,
+        }
+    }
+
+    /// UTF-16: Produce reordered levels for a line into `out_levels`.
+    pub fn reordered_levels_into_utf16(
+        &mut self,
+        info: &BidiInfo<'_>,
+        para: &ParagraphInfo,
+        line: core::ops::Range<usize>,
+        out_levels: &mut Vec<Level>,
+    ) {
+        assert!(line.start <= info.levels.len());
+        assert!(line.end <= info.levels.len());
+        out_levels.clear();
+        out_levels.extend_from_slice(&info.levels);
+        let line_classes = &info.original_classes[line.clone()];
+        let line_levels = &mut out_levels[line.clone()];
+        let line_str: &[u16] = &info.text[line.clone()];
+        reorder_levels(line_classes, line_levels, line_str, para.level);
+    }
+
+    /// UTF-16: Compute visual runs and levels into provided buffers.
+    pub fn visual_runs_into_utf16(
+        &mut self,
+        info: &BidiInfo<'_>,
+        para: &ParagraphInfo,
+        line: core::ops::Range<usize>,
+        out_levels: &mut Vec<Level>,
+        out_runs: &mut Vec<LevelRun>,
+    ) {
+        self.reordered_levels_into_utf16(info, para, line.clone(), out_levels);
+        super::visual_runs_for_line_into(out_levels, &line, out_runs);
+    }
+
+    /// UTF-16: Reorder a line writing the result into `out_text`.
+    pub fn reorder_line_into_utf16(
+        &mut self,
+        info: &BidiInfo<'_>,
+        para: &ParagraphInfo,
+        line: core::ops::Range<usize>,
+        out_text: &mut Vec<u16>,
+    ) {
+        reorder_line_into_utf16_impl(
+            self,
+            info.text,
+            &info.levels,
+            &info.original_classes,
+            para,
+            line,
+            out_text,
+        );
+    }
+}
+
+fn reorder_line_into_utf16_impl(
+    _ctx: &mut crate::BidiContext,
+    text: &[u16],
+    full_levels: &[Level],
+    full_classes: &[BidiClass],
+    para: &ParagraphInfo,
+    line: core::ops::Range<usize>,
+    out_text: &mut Vec<u16>,
+) {
+    if !level::has_rtl(&full_levels[line.clone()]) {
+        out_text.clear();
+        out_text.extend_from_slice(&text[line]);
+        return;
+    }
+    let mut levels_buf = Vec::new();
+    let mut runs_buf = Vec::new();
+    levels_buf.clear();
+    levels_buf.extend_from_slice(full_levels);
+    let line_classes = &full_classes[line.clone()];
+    let line_levels = &mut levels_buf[line.clone()];
+    let line_str: &[u16] = &text[line.clone()];
+    reorder_levels(line_classes, line_levels, line_str, para.level);
+    super::visual_runs_for_line_into(&levels_buf, &line, &mut runs_buf);
+    out_text.clear();
+    out_text.reserve(line.len());
+    for run in runs_buf {
+        if levels_buf[run.start].is_rtl() {
+            let mut buf = [0; 2];
+            for c in text[run].chars().rev() {
+                out_text.extend(c.encode_utf16(&mut buf).iter());
+            }
+        } else {
+            out_text.extend(&text[run]);
+        }
+    }
 }
 
 /// Contains a reference of `BidiInfo` and one of its `paragraphs`.
